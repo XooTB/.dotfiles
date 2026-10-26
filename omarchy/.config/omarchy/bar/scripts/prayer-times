@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# Islamic prayer times for the Omarchy bar (command module).
+# Computed locally (PrayTimes.org algorithm), no network needed.
+#
+#   prayer-times          Waybar-style JSON for a command module
+#   prayer-times --json   full schedule (windows, markers) for the QML widget
+#   prayer-times --list   plain-text schedule
+
+import json
+import math
+import sys
+from datetime import date, datetime, timedelta
+
+# --- Settings -------------------------------------------------------------
+LATITUDE = 23.8103   # Dhaka
+LONGITUDE = 90.4125
+FAJR_ANGLE = 18.0    # Karachi method (University of Islamic Sciences)
+ISHA_ANGLE = 18.0
+ASR_FACTOR = 2       # 1 = Shafi'i/Maliki/Hanbali, 2 = Hanafi
+# When Isha's window ends: "midnight" (Islamic midnight, the preferred end;
+# praying until Fajr is still valid) or "fajr"
+ISHA_END = "midnight"
+# Per-prayer minute adjustments, e.g. to match your local mosque/calendar
+OFFSETS = {"Fajr": 0, "Sunrise": 0, "Dhuhr": 1, "Asr": 0, "Maghrib": 1, "Isha": 0}
+# --------------------------------------------------------------------------
+
+NAMES = ["Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"]
+
+
+def dsin(d): return math.sin(math.radians(d))
+def dcos(d): return math.cos(math.radians(d))
+def dtan(d): return math.tan(math.radians(d))
+def darcsin(x): return math.degrees(math.asin(x))
+def darccos(x): return math.degrees(math.acos(max(-1.0, min(1.0, x))))
+def darctan2(y, x): return math.degrees(math.atan2(y, x))
+def darccot(x): return math.degrees(math.atan(1 / x))
+def fix(a, b): return a - b * math.floor(a / b)
+
+
+def julian(d):
+    y, m = d.year, d.month
+    if m <= 2:
+        y, m = y - 1, m + 12
+    a = y // 100
+    b = 2 - a + a // 4
+    return math.floor(365.25 * (y + 4716)) + math.floor(30.6001 * (m + 1)) + d.day + b - 1524.5
+
+
+def sun_position(jd):
+    d = jd - 2451545.0
+    g = fix(357.529 + 0.98560028 * d, 360)
+    q = fix(280.459 + 0.98564736 * d, 360)
+    lam = fix(q + 1.915 * dsin(g) + 0.020 * dsin(2 * g), 360)
+    e = 23.439 - 0.00000036 * d
+    ra = darctan2(dcos(e) * dsin(lam), dcos(lam)) / 15
+    eqt = q / 15 - fix(ra, 24)
+    decl = darcsin(dsin(e) * dsin(lam))
+    return decl, eqt
+
+
+def compute_day(d):
+    """Return {name: datetime} for the given local date."""
+    jd = julian(d) - LONGITUDE / (15 * 24)
+
+    def mid_day(t):
+        _, eqt = sun_position(jd + t)
+        return fix(12 - eqt, 24)
+
+    def angle_time(angle, t, ccw=False):
+        decl, _ = sun_position(jd + t)
+        noon = mid_day(t)
+        h = darccos((-dsin(angle) - dsin(decl) * dsin(LATITUDE)) /
+                    (dcos(decl) * dcos(LATITUDE))) / 15
+        return noon - h if ccw else noon + h
+
+    def asr_time(t):
+        decl, _ = sun_position(jd + t)
+        angle = -darccot(ASR_FACTOR + dtan(abs(LATITUDE - decl)))
+        return angle_time(angle, t)
+
+    # Initial guesses (hours) refined by one pass, as PrayTimes does
+    guess = {"Fajr": 5, "Sunrise": 6, "Dhuhr": 12, "Asr": 13, "Maghrib": 18, "Isha": 18}
+    t = {k: v / 24 for k, v in guess.items()}
+    hours = {
+        "Fajr": angle_time(FAJR_ANGLE, t["Fajr"], ccw=True),
+        "Sunrise": angle_time(0.833, t["Sunrise"], ccw=True),
+        "Dhuhr": mid_day(t["Dhuhr"]),
+        "Asr": asr_time(t["Asr"]),
+        "Maghrib": angle_time(0.833, t["Maghrib"]),
+        "Isha": angle_time(ISHA_ANGLE, t["Isha"]),
+    }
+
+    midnight = datetime(d.year, d.month, d.day).astimezone()
+    tz_hours = midnight.utcoffset().total_seconds() / 3600
+    out = {}
+    for name in NAMES:
+        local = hours[name] + tz_hours - LONGITUDE / 15 + OFFSETS.get(name, 0) / 60
+        out[name] = midnight + timedelta(hours=local)
+    return out
+
+
+def fmt(dt):
+    return dt.strftime("%-I:%M %p")
+
+
+def ms(dt):
+    return int(dt.timestamp() * 1000)
+
+
+def duration(delta):
+    mins = max(0, int(delta.total_seconds() // 60) + 1)
+    return f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+
+
+def prayer_day(d):
+    """Windows for the prayer day that starts at Fajr on date d."""
+    t = compute_day(d)
+    nxt = compute_day(d + timedelta(days=1))
+    midnight = t["Maghrib"] + (nxt["Fajr"] - t["Maghrib"]) / 2
+    isha_end = nxt["Fajr"] if ISHA_END == "fajr" else midnight
+    windows = [
+        ("Fajr", t["Fajr"], t["Sunrise"]),
+        ("Dhuhr", t["Dhuhr"], t["Asr"]),
+        ("Asr", t["Asr"], t["Maghrib"]),
+        ("Maghrib", t["Maghrib"], t["Isha"]),
+        ("Isha", t["Isha"], isha_end),
+    ]
+    markers = [("Sunrise", t["Sunrise"]), ("Midnight", midnight)]
+    return {
+        "date": d,
+        "start": t["Fajr"],
+        "end": nxt["Fajr"],
+        "windows": windows,
+        "markers": markers,
+        "isha_grace_end": nxt["Fajr"] if ISHA_END == "midnight" else None,
+        "next_fajr": nxt["Fajr"],
+    }
+
+
+def main():
+    now = datetime.now().astimezone()
+    # Before today's Fajr we're still in yesterday's prayer day (Isha / night)
+    d = now.date()
+    if now < compute_day(d)["Fajr"]:
+        d -= timedelta(days=1)
+    day = prayer_day(d)
+
+    current = next(((n, a, b) for n, a, b in day["windows"] if a <= now < b), None)
+    upcoming = next(((n, a) for n, a, _ in day["windows"] if a > now), None)
+    if upcoming is None:
+        upcoming = ("Fajr", day["next_fajr"])
+
+    if current:
+        name, _, end = current
+        text = f"{name} until {fmt(end)} · {duration(end - now)}"
+        status = f"{name} ends at {fmt(end)}, {duration(end - now)} left"
+    else:
+        name, at = upcoming
+        text = f"{name} {fmt(at)} · in {duration(at - now)}"
+        status = f"{name} starts at {fmt(at)}, in {duration(at - now)}"
+
+    lines = [status, ""]
+    for n, a, b in day["windows"]:
+        marker = "▸ " if current and current[0] == n else "  "
+        lines.append(f"{marker}{n:<8} {fmt(a):>8} – {fmt(b)}")
+    for n, at in day["markers"]:
+        lines.append(f"  {n:<8} {fmt(at):>8}")
+    tooltip = "\n".join(lines)
+
+    if "--list" in sys.argv:
+        print(tooltip)
+        return
+
+    if "--json" in sys.argv:
+        print(json.dumps({
+            "now": ms(now),
+            "text": text,
+            "date": day["date"].strftime("%A, %d %B"),
+            "dayStart": ms(day["start"]),
+            "dayEnd": ms(day["end"]),
+            "current": {"name": current[0], "start": ms(current[1]), "end": ms(current[2]),
+                        "endLabel": fmt(current[2])} if current else None,
+            "next": {"name": upcoming[0], "at": ms(upcoming[1]), "label": fmt(upcoming[1])},
+            "windows": [{"name": n, "start": ms(a), "end": ms(b),
+                         "startLabel": fmt(a), "endLabel": fmt(b)} for n, a, b in day["windows"]],
+            "markers": [{"name": n, "at": ms(at), "label": fmt(at)} for n, at in day["markers"]],
+            "ishaGraceEnd": ms(day["isha_grace_end"]) if day["isha_grace_end"] else None,
+            "ishaGraceLabel": fmt(day["isha_grace_end"]) if day["isha_grace_end"] else "",
+            "method": f"Fajr/Isha {FAJR_ANGLE:g}°, Asr {'Hanafi' if ASR_FACTOR == 2 else 'Standard'}",
+        }))
+        return
+
+    print(json.dumps({"text": text, "tooltip": tooltip, "class": "active" if current else "normal"}))
+
+
+if __name__ == "__main__":
+    main()
